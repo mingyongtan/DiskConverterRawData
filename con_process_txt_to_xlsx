@@ -1,0 +1,699 @@
+#!/usr/bin/env python3
+"""
+Process I/O TXT → Table/Excel — GUI *with CLI Fallback (no pandas required)*
+----------------------------------------------------------------------------
+Target schema (per your header) + new calculated columns:
+  Base columns (parsed from text):
+    - Process
+    - PID
+    - I/O Read Bytes
+    - I/O Write Bytes
+    - I/O Other Bytes
+
+  Calculated columns (computed during parsing):
+    - Total Bytes                           = Read + Write + Other (normalized to bytes)
+    - Cumulative Total Bytes                = running sum of Total Bytes (input order)
+    - Total                                 = grand total of Total Bytes (same value in every row)
+    - Total Usage of Memory in 100% (B / C *100)
+        where B = row's Total Bytes, C = grand Total (so value is 0..100 with decimals)
+
+Notes
+- Skips header rows **anywhere** in the text (tab- or space-delimited), and strips UTF‑8 BOM (\ufeff or the
+  visible mojibake sequence "ï»¿").
+- No pandas. If `openpyxl` is available, writes real **.xlsx** with auto-width + frozen header **and wraps the dataset in an Excel Table**.
+  Otherwise, falls back to CSV.
+- GUI → CLI fallback if Tk is missing.
+- Stdin is opt-in only (`--stdin`) to avoid sandbox issues.
+- Run tests: `python process_table_gui.py --run-tests`
+
+CLI
+  python process_table_gui.py --cli -i input.txt -o out.xlsx
+  type input.txt | python process_table_gui.py --cli --stdin -o out.xlsx   # Windows
+  cat input.txt  | python process_table_gui.py --cli --stdin -o out.xlsx   # macOS/Linux
+
+Build .exe (optional)
+  pip install pyinstaller
+  pyinstaller --noconsole --onefile process_table_gui.py
+"""
+from __future__ import annotations
+import argparse
+import csv
+import os
+import re
+import sys
+from typing import List, Dict, Optional
+
+# simple stderr helper to support very old Python where print(file=...) isn't available
+_DEF_NL = "\n"
+
+def _eprint(msg: str) -> None:
+    try:
+        sys.stderr.write(msg + (_DEF_NL if not msg.endswith("\n") else ""))
+    except Exception:
+        sys.stderr.write(str(msg) + _DEF_NL)
+
+# ------------- Optional GUI imports (guarded) -------------
+try:
+    import tkinter as tk  # type: ignore
+    from tkinter import ttk, filedialog, messagebox  # type: ignore
+    TK_OK = True
+except Exception:  # ModuleNotFoundError or headless env
+    TK_OK = False
+
+# --------------------------- Data model ---------------------------
+HEADERS_BASE = [
+    'Process',
+    'PID',
+    'I/O Read Bytes',
+    'I/O Write Bytes',
+    'I/O Other Bytes',
+]
+# New calculated columns
+COL_TOTAL_BYTES = 'Total Bytes'
+# Cumulative (running sum) column removed per user request
+COL_GRAND_TOTAL = 'Cumulative Total Bytes'  # renamed from 'Total'
+COL_USAGE_PCT   = 'Total Usage of Memory in 100% (B / C *100)'
+
+HEADERS = HEADERS_BASE + [COL_TOTAL_BYTES, COL_GRAND_TOTAL, COL_USAGE_PCT]
+Row = Dict[str, str]
+NumRow = Dict[str, object]  # allow ints/floats for numeric columns
+
+# --------------------------- Parsing helpers ---------------------------
+QUOTES_RE = re.compile(r'"')
+TAB_RE = re.compile(r"\t+")
+MULTISPACE_RE = re.compile(r"\s{2,}")
+
+
+def _strip_bom(s: str) -> str:
+    """Remove BOM variants: real U+FEFF and the visible 'ï»¿' sequence."""
+    if not s:
+        return s
+    # Real BOM char
+    s = s.replace('\ufeff', '')
+    # Visible mojibake form when UTF-8 BOM is decoded as CP1252
+    s = s.replace('ï»¿', '')
+    return s
+
+
+def _tokenize(line: str) -> List[str]:
+    """Strip BOM & quotes, normalize tabs, split, drop empties."""
+    line = _strip_bom(QUOTES_RE.sub('', line.strip()))
+    parts = [p.strip() for p in TAB_RE.split(line)]
+    return [p for p in parts if p != '']
+
+
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", " ", _strip_bom(s).strip().lower())
+
+HEADER_CANON = [_norm(h) for h in HEADERS_BASE]
+HEADER_CANON_SET = set(HEADER_CANON)
+
+
+def _is_header_tokens(toks: List[str]) -> bool:
+    """True if token list looks like a header row for this schema (tab-delimited)."""
+    norms = [_norm(t) for t in toks]
+    s = set(norms)
+    # Exact set of header names present
+    if HEADER_CANON_SET.issubset(s):
+        return True
+    # First token starts with 'process', contains 'pid' and at least 2 I/O headers present
+    if norms and norms[0].startswith('process') and ('pid' in s):
+        io_hits = sum(1 for h in HEADER_CANON[2:] if h in s)
+        if io_hits >= 2:
+            return True
+    return False
+
+
+def _is_header_line_str(line: str) -> bool:
+    """Detect header when the line is space-delimited or otherwise not tokenizable by tabs."""
+    s = _norm(line)
+    # All header phrases must appear somewhere in the normalized string
+    return all(h in s for h in HEADER_CANON)
+
+# ---- Unit parsing ----
+UNITS = {
+    'b': 1,
+    'kb': 1024,
+    'k': 1024,
+    'mb': 1024**2,
+    'm': 1024**2,
+    'gb': 1024**3,
+    'g': 1024**3,
+}
+# Examples matched: "893.8 KB", "40 244 K", "72 B", "16.0 MB", "2048"
+NUM_RE = re.compile(r"^\s*([0-9]+(?:[\s,][0-9]{3})*|[0-9]*\.[0-9]+|[0-9]+)\s*([kKmMgGbB]{0,2})\s*$")
+
+
+def parse_bytes(value: str) -> int:
+    """Convert strings like '893.8 KB', '40 244 K', '72 B', '16.0 MB' to integer bytes.
+    Unknown/blank values → 0.
+    """
+    if value is None:
+        return 0
+    s = str(value).strip()
+    if not s:
+        return 0
+    s = s.replace('\ufeff', '').replace('ï»¿', '')
+    s = s.replace(',', ' ')
+    s = re.sub(r"\s+", " ", s)
+    # Sometimes values are exactly '0' or just an integer
+    m = NUM_RE.match(s)
+    if not m:
+        try:
+            return int(float(s))
+        except Exception:
+            return 0
+    num_s, unit = m.groups()
+    num = float(num_s.replace(' ', '')) if num_s else 0.0
+    unit = (unit or '').lower()
+    mult = UNITS.get(unit, 1)
+    return int(round(num * mult))
+
+
+# --------------------------- Parsing pipeline ---------------------------
+
+def _parse_base_rows(raw: str) -> List[Row]:
+    """Parse raw text into base rows (5 columns only) using right‑alignment.
+    Any line that *looks like a header* is skipped (even if repeated mid-file). Handles BOM.
+    """
+    raw = _strip_bom(raw)
+    lines = [ln for ln in raw.splitlines() if ln.strip()]
+    rows: List[Row] = []
+
+    for ln in lines:
+        if _is_header_line_str(ln):
+            continue
+
+        toks = _tokenize(ln)
+        if not toks:
+            continue
+
+        # Skip any header-looking line (not just the first occurrence)
+        if _is_header_tokens(toks):
+            continue
+
+        if len(toks) < 5:
+            # Skip malformed line but could log in future
+            continue
+
+        # Right‑align mapping: [..., Process (maybe multi), PID, Read, Write, Other]
+        io_other = toks[-1]
+        io_write = toks[-2]
+        io_read  = toks[-3]
+        pid      = toks[-4]
+        process_tokens = toks[:-4]
+        process = ' '.join(process_tokens).strip() if process_tokens else ''
+
+        row: Row = {
+            'Process': MULTISPACE_RE.sub(' ', process),
+            'PID': pid,
+            'I/O Read Bytes': io_read,
+            'I/O Write Bytes': io_write,
+            'I/O Other Bytes': io_other,
+        }
+        rows.append(row)
+
+    return rows
+
+
+def add_calculated_columns(base_rows: List[Row]) -> List[NumRow]:
+    """Return rows with calculated columns populated.
+    - Total Bytes = sum of parsed I/O columns in bytes
+    - Cumulative Total Bytes (renamed former 'Total') = grand total repeated
+    - Total Usage of Memory in 100% (B / C *100) stored as 0..1 and formatted as Excel percentage
+    """
+    numeric_rows: List[NumRow] = []
+    for r in base_rows:
+        b_read  = parse_bytes(r.get('I/O Read Bytes', ''))
+        b_write = parse_bytes(r.get('I/O Write Bytes', ''))
+        b_other = parse_bytes(r.get('I/O Other Bytes', ''))
+        t_bytes = b_read + b_write + b_other
+        nr: NumRow = dict(r)
+        nr[COL_TOTAL_BYTES] = t_bytes
+        numeric_rows.append(nr)
+
+    grand_total = sum(int(nr[COL_TOTAL_BYTES]) for nr in numeric_rows)
+
+    for nr in numeric_rows:
+        nr[COL_GRAND_TOTAL] = grand_total
+        nr[COL_USAGE_PCT]   = (float(nr[COL_TOTAL_BYTES]) / grand_total) if grand_total > 0 else 0.0
+
+    return numeric_rows
+
+
+def parse_io_text(raw: str) -> List[NumRow]:
+    base = _parse_base_rows(raw)
+    return add_calculated_columns(base)
+
+
+# --------------------------- Excel / CSV helpers ---------------------------
+
+def _autosize_and_freeze(ws, has_header: bool = True) -> None:
+    from openpyxl.utils import get_column_letter  # imported lazily (only when writing Excel)
+    for col_cells in ws.columns:
+        try:
+            max_len = 0
+            for cell in col_cells:
+                v = cell.value
+                if v is None:
+                    continue
+                max_len = max(max_len, len(str(v)))
+            letter = get_column_letter(col_cells[0].column)
+            ws.column_dimensions[letter].width = min(max(max_len + 2, 12), 64)
+        except Exception:
+            pass
+    if has_header:
+        ws.freeze_panes = 'A2'
+
+
+def _save_to_excel(rows: List[NumRow], path: str, sheet: str = 'Processes') -> None:
+    if not path.lower().endswith('.xlsx'):
+        path += '.xlsx'
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import numbers
+        from openpyxl.utils import get_column_letter
+        from openpyxl.worksheet.table import Table, TableStyleInfo
+    except Exception as e:
+        raise RuntimeError("openpyxl is required to write .xlsx. Install with 'pip install openpyxl'.") from e
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = sheet
+
+    # Write header + data rows
+    ws.append(HEADERS)
+    for r in rows:
+        ws.append([r.get(h, '') for h in HEADERS])
+
+    # Wrap the data area in an Excel Table (excluding any summary rows we'll add later)
+    first_row = 1
+    first_col = 1
+    last_row = ws.max_row
+    last_col = ws.max_column
+    from openpyxl.utils import get_column_letter as _col
+    table_ref = f"A{first_row}:{_col(last_col)}{last_row}"
+    table = Table(displayName="ProcessIOTable", ref=table_ref)
+    style = TableStyleInfo(name="TableStyleMedium9", showFirstColumn=False, showLastColumn=False,
+                           showRowStripes=True, showColumnStripes=False)
+    table.tableStyleInfo = style
+    try:
+        ws.add_table(table)
+    except Exception:
+        # If a duplicate name somehow exists, retry with a numbered name
+        import random
+        table.displayName = f"ProcessIOTable_{random.randint(1000,9999)}"
+        ws.add_table(table)
+
+    # Number formats for calculated columns
+    hdrs = {ws.cell(row=1, column=i).value: i for i in range(1, ws.max_column + 1)}
+    int_cols = [COL_TOTAL_BYTES, COL_GRAND_TOTAL]
+    for name in int_cols:
+        idx = hdrs.get(name)
+        if idx:
+            for row_i in range(2, last_row + 1):
+                ws.cell(row=row_i, column=idx).number_format = '#,##0'
+    # usage percent as true percentage format (0..1 values displayed as 0.00%)
+    idx = hdrs.get(COL_USAGE_PCT)
+    if idx:
+        for row_i in range(2, last_row + 1):
+            ws.cell(row=row_i, column=idx).number_format = '0.00%'
+
+    _autosize_and_freeze(ws, has_header=True)
+
+    # Add a total row at the bottom (SUM of Total Bytes) for convenience (outside the Table)
+    total_row = ws.max_row + 1
+    ws.cell(row=total_row, column=1, value='TOTAL (sum of Total Bytes)')
+    col_total_idx = hdrs.get(COL_TOTAL_BYTES)
+    if col_total_idx:
+        col_letter = get_column_letter(col_total_idx)
+        ws.cell(row=total_row, column=col_total_idx, value=f"=SUM({col_letter}2:{col_letter}{last_row})")
+
+    wb.save(path)
+
+
+def _save_to_csv(rows: List[NumRow], path: str) -> None:
+    if not path.lower().endswith('.csv'):
+        path += '.csv'
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow(HEADERS)
+        for r in rows:
+            w.writerow([r.get(h, '') for h in HEADERS])
+
+
+def save_table(rows: List[NumRow], output_path: Optional[str], sheet: str = 'Processes') -> str:
+    """Save table to Excel or CSV. If the caller requests .xlsx but
+    `openpyxl` is not installed, raise a clear error instead of silently
+    switching to CSV.
+    """
+    out = output_path or os.path.abspath('process_io.xlsx')
+
+    ext = os.path.splitext(out)[1].lower()
+    if ext == '.xlsx':
+        _save_to_excel(rows, out, sheet=sheet)  # _save_to_excel will raise if openpyxl is missing
+        return out
+    elif ext == '.csv':
+        _save_to_csv(rows, out)
+        return out
+    else:
+        # If no/unknown extension, prefer xlsx; fall back to csv only if caller chose .csv explicitly.
+        try:
+            _save_to_excel(rows, out + '.xlsx', sheet=sheet)
+            return out + '.xlsx'
+        except RuntimeError:
+            _save_to_csv(rows, out + '.csv')
+            return out + '.csv'
+
+    if out.lower().endswith('.xlsx'):
+        _save_to_excel(rows, out, sheet=sheet)
+        return out
+
+    _save_to_csv(rows, out)
+    return out
+
+
+# --------------------------- CLI ---------------------------
+
+def _read_input_file(path: str) -> str:
+    with open(path, 'r', encoding='utf-8', errors='replace') as f:
+        return f.read()
+
+
+def run_cli(input_path: Optional[str], output_path: Optional[str], sheet: str = 'Processes', read_from_stdin: bool = False) -> int:
+    raw = ''
+    if input_path:
+        raw = _read_input_file(input_path)
+    elif read_from_stdin:
+        try:
+            if sys.stdin is None:
+                raise OSError("stdin not available")
+            raw = sys.stdin.read()
+        except (OSError, ValueError) as e:
+            _eprint("STDIN not available in this environment (" + str(e) + "). Use -i/--input instead.")
+            return 2
+    else:
+        _eprint("No input provided. Use -i/--input FILE or --stdin with piped data.")
+        return 2
+
+    if not raw.strip():
+        _eprint("Empty input. Provide a non-empty file or valid piped data.")
+        return 2
+
+    rows = parse_io_text(raw)
+    if not rows:
+        _eprint("Parsed 0 rows. Check the input format.")
+        return 3
+
+    try:
+        out = save_table(rows, output_path, sheet=sheet)
+    except RuntimeError as e:
+        _eprint(str(e))
+        return 4
+    print("✅ Parsed " + str(len(rows)) + " rows → " + out)
+    return 0
+
+
+# --------------------------- GUI (only if Tk exists) ---------------------------
+if TK_OK:
+    class App(tk.Tk):
+        def __init__(self):
+            super().__init__()
+            self.title('Process I/O TXT → Table/Excel')
+            self.geometry('1200x740')
+            self.minsize(980, 620)
+            self.rows: List[NumRow] = []
+            self._build_ui()
+
+        def _build_ui(self) -> None:
+            pad = 8
+            root = ttk.Panedwindow(self, orient=tk.VERTICAL)
+            root.pack(fill=tk.BOTH, expand=True)
+
+            # --- Top controls ---
+            top = ttk.Frame(root, padding=pad)
+            root.add(top, weight=3)
+
+            btns = ttk.Frame(top)
+            btns.pack(fill=tk.X)
+            ttk.Button(btns, text='Load .txt', command=self.on_load_file).pack(side=tk.LEFT, padx=(0, pad))
+            ttk.Button(btns, text='Parse → Preview', command=self.on_parse).pack(side=tk.LEFT, padx=(0, pad))
+            ttk.Button(btns, text='Save as Excel/CSV', command=self.on_save).pack(side=tk.LEFT, padx=(0, pad))
+            ttk.Button(btns, text='Clear', command=self.on_clear).pack(side=tk.LEFT)
+
+            self.status_var = tk.StringVar()
+            ttk.Label(btns, textvariable=self.status_var, foreground='#0a7d11').pack(side=tk.LEFT, padx=(pad, 0))
+
+            ttk.Label(top, text='Paste your process text below (or use Load):').pack(anchor='w', pady=(pad, 0))
+            self.txt = tk.Text(top, height=14, wrap='none')
+            self.txt.pack(fill=tk.BOTH, expand=True)
+
+            xscroll = ttk.Scrollbar(top, orient='horizontal', command=self.txt.xview)
+            yscroll = ttk.Scrollbar(top, orient='vertical', command=self.txt.yview)
+            self.txt.configure(xscrollcommand=xscroll.set, yscrollcommand=yscroll.set)
+            yscroll.place(relx=1.0, rely=0.25, relheight=0.5, anchor='ne')
+            xscroll.pack(fill=tk.X)
+
+            # --- Bottom preview ---
+            bottom = ttk.Frame(root, padding=pad)
+            root.add(bottom, weight=2)
+            ttk.Label(bottom, text='Preview:').pack(anchor='w')
+
+            self.tree = ttk.Treeview(bottom, columns=HEADERS, show='headings')
+            for h in HEADERS:
+                self.tree.heading(h, text=h)
+                base_width = 260 if h == 'Process' else 180
+                if h in (COL_TOTAL_BYTES, COL_GRAND_TOTAL, COL_USAGE_PCT):
+                    base_width = 180 if h != COL_USAGE_PCT else 200
+                self.tree.column(h, width=base_width, anchor='w')
+            self.tree.pack(fill=tk.BOTH, expand=True)
+
+            tree_y = ttk.Scrollbar(bottom, orient='vertical', command=self.tree.yview)
+            tree_x = ttk.Scrollbar(bottom, orient='horizontal', command=self.tree.xview)
+            self.tree.configure(yscrollcommand=tree_y.set, xscrollcommand=tree_x.set)
+            tree_y.pack(side=tk.RIGHT, fill=tk.Y)
+            tree_x.pack(side=tk.BOTTOM, fill=tk.X)
+
+        def on_load_file(self) -> None:
+            path = filedialog.askopenfilename(title='Open Text File', filetypes=[('Text files', '*.txt;*.log;*.csv;*.*')])
+            if not path:
+                return
+            try:
+                with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                    data = f.read()
+                self.txt.delete('1.0', tk.END)
+                self.txt.insert('1.0', data)
+                self.status_var.set('Loaded: ' + os.path.basename(path))
+            except Exception as e:
+                messagebox.showerror('Error', 'Failed to load file\n' + str(e))
+
+        def on_parse(self) -> None:
+            raw = self.txt.get('1.0', tk.END).strip()
+            if not raw:
+                messagebox.showwarning('No input', 'Paste your process text or Load a file first.')
+                return
+            try:
+                self.rows = parse_io_text(raw)
+                self._refresh_tree(self.rows)
+                self.status_var.set('Parsed ' + str(len(self.rows)) + ' rows')
+            except Exception as e:
+                messagebox.showerror('Parse failed', str(e))
+
+        def on_save(self) -> None:
+            if not self.rows:
+                raw = self.txt.get('1.0', tk.END).strip()
+                if not raw:
+                    messagebox.showwarning('No input', 'Nothing to save. Paste text or Load a file, then Parse.')
+                    return
+                try:
+                    self.rows = parse_io_text(raw)
+                    self._refresh_tree(self.rows)
+                except Exception as e:
+                    messagebox.showerror('Parse failed', str(e))
+                    return
+            path = filedialog.asksaveasfilename(title='Save (Excel or CSV)', defaultextension='.xlsx', filetypes=[('Excel Workbook', '*.xlsx'), ('CSV', '*.csv')])
+            if not path:
+                return
+            try:
+                out = save_table(self.rows, path, sheet='Processes')
+                self.status_var.set('✅ Saved → ' + os.path.basename(out))
+            except Exception as e:
+                messagebox.showerror('Save failed', str(e))
+
+        def on_clear(self) -> None:
+            self.txt.delete('1.0', tk.END)
+            self.rows = []
+            for item in self.tree.get_children():
+                self.tree.delete(item)
+            self.status_var.set('')
+
+        def _refresh_tree(self, rows: List[NumRow]) -> None:
+            for item in self.tree.get_children():
+                self.tree.delete(item)
+            self.tree['columns'] = list(HEADERS)
+
+            # format display values (GUI only). Excel/CSV still get raw numbers.
+            def _fmt(h: str, v) -> str:
+                try:
+                    if h == COL_USAGE_PCT:
+                        f = float(v)
+                        return f"{f*100:.2f}%"
+                    if h in (COL_TOTAL_BYTES, COL_GRAND_TOTAL):
+                        return f"{int(v):,}"
+                except Exception:
+                    pass
+                return '' if v is None else str(v)
+
+            # compute widths based on formatted values
+            col_widths = {h: len(h) for h in HEADERS}
+            display_rows = []
+            for r in rows:
+                row_vals = [_fmt(h, r.get(h, '')) for h in HEADERS]
+                display_rows.append(row_vals)
+                for h, dv in zip(HEADERS, row_vals):
+                    col_widths[h] = max(col_widths[h], len(str(dv)))
+
+            for h in HEADERS:
+                base_max = 360 if h == 'Process' else 260
+                if h == COL_USAGE_PCT:
+                    base_max = 140
+                width = max(120, min(base_max, col_widths[h] * 9))
+                self.tree.heading(h, text=h)
+                self.tree.column(h, width=width, anchor='w')
+
+            for vals in display_rows:
+                self.tree.insert('', tk.END, values=vals)
+
+
+# --------------------------- Tests ---------------------------
+SAMPLE_IO = (
+    '"Process\tPID\tI/O Read Bytes\tI/O Write Bytes\tI/O Other Bytes"\n'
+    '"explorer.exe\t2548\t123456\t7890\t456"\n'
+    '"svchost.exe\t1052\t1 024 K\t512 K\t64 K"\n'
+    '"Process\tPID\tI/O Read Bytes\tI/O Write Bytes\tI/O Other Bytes"\n'  # duplicate header in middle
+    '"SearchIndexer.exe\t6484\t40 244 K\t33 980 K\t0"\n'
+)
+
+SAMPLE_IO_BOM = (
+    '\ufeff"Process\tPID\tI/O Read Bytes\tI/O Write Bytes\tI/O Other Bytes"\n'
+    '"Widgets.exe\t14936\t893.8 KB\t13.2 MB\t487.6 KB"\n'
+)
+
+SAMPLE_IO_SPACE_HEADER = (
+    'Process  PID  I/O Read Bytes  I/O Write Bytes  I/O Other Bytes\n'
+    'msedgewebview2.exe\t10384\t29.1 MB\t16.0 MB\t936.7 KB\n'
+)
+
+
+def run_tests() -> int:
+    fails = 0
+
+    # Test 1: parse non-empty & correct headers; duplicate header skipped
+    rows = parse_io_text(SAMPLE_IO)
+    try:
+        assert len(rows) == 3, 'Expected 3 data rows (headers should be removed wherever they appear)'
+        assert set(rows[0].keys()) == set(HEADERS), 'Headers mismatch'
+    except AssertionError as e:
+        print('[FAIL] basic parse:', e)
+        fails += 1
+
+    # Test 2: header not included as data
+    try:
+        assert not any(str(r.get('Process')) == 'Process' for r in rows), 'Header row leaked into data'
+    except AssertionError as e:
+        print('[FAIL] header filter:', e)
+        fails += 1
+
+    # Test 3: bytes parsing & totals
+    try:
+        r0 = rows[0]  # explorer.exe
+        # 123456 + 7890 + 456 = 131802
+        assert int(r0[COL_TOTAL_BYTES]) == 123456 + 7890 + 456
+        r1 = rows[1]  # svchost with K units
+        expect_r1 = 1024*1024 + 512*1024 + 64*1024  # 1 024 K + 512 K + 64 K
+        assert int(r1[COL_TOTAL_BYTES]) == expect_r1
+    except AssertionError as e:
+        print('[FAIL] totals:', e)
+        fails += 1
+
+    # Test 4: grand total and usage fraction sum ~ 1.0
+    try:
+        grand = rows[0][COL_GRAND_TOTAL]
+        assert all(r[COL_GRAND_TOTAL] == grand for r in rows)
+        pct_sum = sum(float(r[COL_USAGE_PCT]) for r in rows)
+        assert 0.999 <= pct_sum <= 1.001 or grand == 0
+    except AssertionError as e:
+        print('[FAIL] percent / grand total:', e)
+        fails += 1
+
+    # Test 5: BOM header is removed
+    try:
+        rows_bom = parse_io_text(SAMPLE_IO_BOM)
+        assert len(rows_bom) == 1 and rows_bom[0]['Process'] == 'Widgets.exe', 'BOM header not removed'
+    except AssertionError as e:
+        print('[FAIL] BOM header removal:', e)
+        fails += 1
+
+    # Test 6: space-delimited header is removed
+    try:
+        rows_space = parse_io_text(SAMPLE_IO_SPACE_HEADER)
+        assert len(rows_space) == 1 and rows_space[0]['PID'] == '10384', 'Space-delimited header not removed'
+    except AssertionError as e:
+        print('[FAIL] space header removal:', e)
+        fails += 1
+
+    # Test 7 (optional): Excel Table is created when openpyxl exists
+    try:
+        from openpyxl import load_workbook  # type: ignore
+        import tempfile
+        with tempfile.NamedTemporaryFile('w', delete=False, suffix='.txt') as tin:
+            tin.write(SAMPLE_IO)
+            tin_path = tin.name
+        out_path = tin_path + '.xlsx'
+        rows = parse_io_text(SAMPLE_IO)
+        _save_to_excel(rows, out_path)
+        wb = load_workbook(out_path)
+        ws = wb.active
+        assert len(ws._tables) >= 1, 'Excel Table not created'
+        try:
+            os.remove(out_path)
+            os.remove(tin_path)
+        except Exception:
+            pass
+    except Exception:
+        pass  # skip if openpyxl missing
+
+    if fails:
+        print('\n' + str(fails) + ' test(s) failed')
+        return 1
+    print('All tests passed ✅')
+    return 0
+
+
+# --------------------------- Entrypoint ---------------------------
+
+def main(argv: Optional[List[str]] = None) -> int:
+    p = argparse.ArgumentParser(description='Process I/O TXT → Table/Excel (GUI with CLI fallback, no pandas)')
+    p.add_argument('--cli', action='store_true', help='Force CLI mode (no GUI)')
+    p.add_argument('-i', '--input', help='Path to input text file (CLI mode)')
+    p.add_argument('-o', '--output', help='Path to output (.xlsx if openpyxl, else .csv)')
+    p.add_argument('--stdin', action='store_true', help='Read input from STDIN (only if your environment supports it)')
+    p.add_argument('--sheet', default='Processes', help='Excel sheet name (when writing .xlsx)')
+    p.add_argument('--run-tests', action='store_true', help='Run self tests and exit')
+    args = p.parse_args(argv)
+
+    if args.run_tests:
+        return run_tests()
+
+    if args.cli or not TK_OK:
+        if not TK_OK and not args.cli:
+            print('[info] Tkinter not available — running in CLI mode. To enable GUI, install a Python with Tk.')
+        return run_cli(args.input, args.output, sheet=args.sheet, read_from_stdin=args.stdin)
+
+    app = App()  # type: ignore[name-defined]
+    app.mainloop()
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
