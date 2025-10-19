@@ -172,6 +172,7 @@ EXTRA_HEADERS = [
     "Total Bytes (B)",
     "Cumulative Total Bytes",
     "Total Usage of I/O in 100%",
+    "Total 20% of Total Usage Col",
 ]
 HEADERS = HEADER_NAMES + EXTRA_HEADERS
 
@@ -194,6 +195,53 @@ def add_calculated_columns(rows: List[Dict[str, object]]) -> List[Dict[str, obje
         r["Cumulative Total Bytes"] = grand
         r["Total Usage of I/O in 100%"] = (r["Total Bytes (B)"] / grand) if grand else 0.0
     return out
+
+# ───────── Pareto helpers (target ~80%, allowed range 78–90%) ─────────
+PARETO_LOW = 0.78
+PARETO_HIGH = 0.90
+PARETO_TARGET = 0.80
+PARETO_COL = "Total 20% of Total Usage Col"
+PCT_COL = "Total Usage of I/O in 100%"
+
+
+def sort_rows_and_compute_pareto(rows: List[Dict[str, object]],
+                                 low: float = PARETO_LOW,
+                                 high: float = PARETO_HIGH,
+                                 target: float = PARETO_TARGET) -> tuple[list[Dict[str, object]], int, float]:
+    """Sort rows by percentage desc, pick top-k whose cumulative is within
+    [low, high] and closest to *target*. Returns (sorted_rows, selected_count,
+    cumulative_sum). Also writes the cumulative_sum into the first row's
+    PARETO_COL so it shows up in Excel as a single value column."""
+    # Sort by % descending for Pareto analysis
+    rows_sorted = sorted(rows, key=lambda r: float(r.get(PCT_COL, 0.0)), reverse=True)
+    pcts = [float(r.get(PCT_COL, 0.0)) for r in rows_sorted]
+
+    cum: list[float] = []
+    s = 0.0
+    for p in pcts:
+        s += p
+        cum.append(s)
+
+    if not cum:
+        if rows_sorted:
+            rows_sorted[0][PARETO_COL] = 0.0
+        return rows_sorted, 0, 0.0
+
+    # Indices whose cumulative is within the allowed range
+    candidates = [(i, v) for i, v in enumerate(cum) if low <= v <= high]
+    if candidates:
+        best_i = min(candidates, key=lambda iv: abs(iv[1] - target))[0]
+    else:
+        # Fallback: closest to target overall
+        best_i = min(range(len(cum)), key=lambda i: abs(cum[i] - target))
+
+    sel_count = best_i + 1
+    best_sum = cum[best_i]
+
+    # Put the total once, in row 2 (first data row) of the final sheet.
+    # We set it on the first dict so it gets written to the first row.
+    rows_sorted[0][PARETO_COL] = best_sum
+    return rows_sorted, sel_count, best_sum
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -292,6 +340,7 @@ def write_disk_sheet(rows_base: List[Dict[str, object]], out_path: str, sheet_na
     from openpyxl import Workbook, load_workbook
     from openpyxl.worksheet.table import Table, TableStyleInfo
     from openpyxl.utils import get_column_letter
+    from openpyxl.styles import PatternFill
 
     if not rows_base:
         raise ValueError("No data parsed from input text.")
@@ -300,6 +349,9 @@ def write_disk_sheet(rows_base: List[Dict[str, object]], out_path: str, sheet_na
         out_path = out_path + ".xlsx"
 
     rows = add_calculated_columns(rows_base)
+
+    # Pareto: sort by percentage and compute the top set near 80% (78–90%)
+    rows, pareto_k, pareto_sum = sort_rows_and_compute_pareto(rows)
 
     if os.path.exists(out_path):
         wb = load_workbook(out_path)
@@ -357,9 +409,24 @@ def write_disk_sheet(rows_base: List[Dict[str, object]], out_path: str, sheet_na
     if idx:
         for r in range(2, last_row + 1):
             ws.cell(r, idx).number_format = "0.00%"
+    # Pareto total column as percentage too
+    pidx = hdr_idx.get(PARETO_COL)
+    if pidx:
+        for r in range(2, last_row + 1):
+            ws.cell(r, pidx).number_format = "0.00%"
 
     # Inject formulas now that the table exists
     _inject_formulas_a1(ws)
+
+    # Highlight the selected Pareto rows (top-k)
+    try:
+        fill = PatternFill(start_color="00FFF2CC", end_color="00FFF2CC", fill_type="solid")
+        for rr in range(2, 2 + pareto_k):  # header is row 1
+            for cc in range(1, last_col + 1):
+                ws.cell(rr, cc).fill = fill
+    except Exception:
+        pass
+
     _autosize(ws)
 
     wb.save(out_path)
@@ -388,6 +455,8 @@ def write_workbook_for_files(file_paths: List[str], out_path: str) -> str:
             if not base_rows:
                 continue
             rows = add_calculated_columns(base_rows)
+            # Pareto: sort and compute for this sheet
+            rows, pareto_k, pareto_sum = sort_rows_and_compute_pareto(rows)
             sname = safe_sheet_name(os.path.splitext(os.path.basename(pth))[0], used_sheets)
             # Create the sheet and write
             from openpyxl.worksheet.table import Table, TableStyleInfo
@@ -405,7 +474,24 @@ def write_workbook_for_files(file_paths: List[str], out_path: str) -> str:
                                                   showLastColumn=False, showRowStripes=True, showColumnStripes=False)
             ws.add_table(table)
             ws.freeze_panes = "A2"
+            # Number formats (percents for pct + pareto col)
+            hdr_idx = {ws.cell(1, i).value: i for i in range(1, ws.max_column + 1)}
+            for nm in ("Total Usage of I/O in 100%", PARETO_COL):
+                idx = hdr_idx.get(nm)
+                if idx:
+                    for rrr in range(2, ws.max_row + 1):
+                        ws.cell(rrr, idx).number_format = "0.00%"
+            # Formulas and highlight
             _inject_formulas_a1(ws)
+            try:
+                from openpyxl.styles import PatternFill as _PF
+                fill = _PF(start_color="00FFF2CC", end_color="00FFF2CC", fill_type="solid")
+                last_col = ws.max_column
+                for rr in range(2, 2 + pareto_k):
+                    for cc in range(1, last_col + 1):
+                        ws.cell(rr, cc).fill = fill
+            except Exception:
+                pass
             _autosize(ws)
         except Exception:
             continue
@@ -532,6 +618,11 @@ if TK_OK:
 
             
         def _refresh(self, rows: List[Dict[str, object]]) -> None:
+            # Sort preview by percentage desc to mirror Excel output
+            try:
+                rows = sorted(rows, key=lambda r: float(r.get("Total Usage of I/O in 100%", 0.0)), reverse=True)
+            except Exception:
+                pass
             def fmt(h: str, v) -> str:
                 try:
                     if h in ("Total Bytes (B)", "Cumulative Total Bytes"):
@@ -629,6 +720,18 @@ def run_tests() -> int:
     except AssertionError as e:
         print("[FAIL] totals:", e); fails += 1
 
+    # Pareto selection sanity: design a distribution where best is ~0.80 within 0.78–0.90
+    try:
+        fake = [
+            {"Process": "p1", "PID": 1, "I/O Read Bytes": "", "I/O Write Bytes": "", "I/O Other Bytes": "",
+             "Total Bytes (B)": 0, "Cumulative Total Bytes": 0, "Total Usage of I/O in 100%": v}
+            for v in [0.60, 0.10, 0.09, 0.08, 0.05]
+        ]
+        srows, k, s = sort_rows_and_compute_pareto(fake)
+        assert 0.78 <= s <= 0.90 and k >= 1, (k, s)
+    except AssertionError as e:
+        print("[FAIL] pareto:", e); fails += 1
+
     try:
         from openpyxl import load_workbook
         with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
@@ -637,7 +740,6 @@ def run_tests() -> int:
         wb = load_workbook(out)
         assert "DiskIO" in wb.sheetnames
         ws = wb["DiskIO"]
-        # Confirm formulas placed
         hdrs = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
         cum_col = hdrs.index("Cumulative Total Bytes") + 1
         assert isinstance(ws.cell(2, cum_col).value, str) and ws.cell(2, cum_col).value.startswith("=")
