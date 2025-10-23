@@ -56,7 +56,7 @@ HEADER_NAMES = [
     "I/O Other Bytes",
 ]
 # Skip any rows with these process names (case-insensitive)
-DROP_PROCESSES = {"procexp64.exe"}
+DROP_PROCESSES = {"procexp64.exe", "sysgau.exe"}
 
 TAB_RE = re.compile(r"\t+")                 # split on one or more tabs
 MULTISPACE_SPLIT = re.compile(r"\s{2,}")    # or on 2+ spaces (common in copy/paste)
